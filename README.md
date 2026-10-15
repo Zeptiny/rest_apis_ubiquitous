@@ -1,17 +1,28 @@
 # REST APIs Ubiquitous
 
-One tiny **Users CRUD REST API**, written four times in four languages:
+One tiny **Users CRUD REST API**, written four times in four languages, all backed by
+**one shared PostgreSQL database**:
 
-| Service          | Language   | Framework                                         | Host port | Directory                            |
-| ---------------- | ---------- | ------------------------------------------------- | --------- | ------------------------------------ |
-| `python-fastapi` | Python     | [FastAPI](https://fastapi.tiangolo.com/)          | `8001`    | [`python-fastapi/`](python-fastapi/) |
-| `node-express`   | Node.js    | [Express 5](https://expressjs.com/)               | `8002`    | [`node-express/`](node-express/)     |
-| `rust-axum`      | Rust       | [Axum](https://github.com/tokio-rs/axum) + Tokio  | `8003`    | [`rust-axum/`](rust-axum/)           |
-| `go-gin`         | Go         | [Gin](https://gin-gonic.com/)                     | `8004`    | [`go-gin/`](go-gin/)                 |
+| Service          | Language   | Framework                                         | Postgres driver                                     | Host port | Directory                            |
+| ---------------- | ---------- | ------------------------------------------------- | --------------------------------------------------- | --------- | ------------------------------------ |
+| `python-fastapi` | Python     | [FastAPI](https://fastapi.tiangolo.com/)          | [psycopg 3](https://www.psycopg.org/psycopg3/) + pool | `8001`  | [`python-fastapi/`](python-fastapi/) |
+| `node-express`   | Node.js    | [Express 5](https://expressjs.com/)               | [node-postgres (`pg`)](https://node-postgres.com/)  | `8002`    | [`node-express/`](node-express/)     |
+| `rust-axum`      | Rust       | [Axum](https://github.com/tokio-rs/axum) + Tokio  | [SQLx](https://github.com/launchbadge/sqlx)         | `8003`    | [`rust-axum/`](rust-axum/)           |
+| `go-gin`         | Go         | [Gin](https://gin-gonic.com/)                     | [pgx v5](https://github.com/jackc/pgx)              | `8004`    | [`go-gin/`](go-gin/)                 |
+| `postgres`       | –          | PostgreSQL 18                                     | –                                                   | `5432`    | [`db/`](db/)                         |
 
 All four implement **exactly the same contract**: same routes, same JSON, same status codes,
-same error messages. Each keeps its data **in memory**, so they make a good side-by-side
-comparison of how each language and framework handles routing, validation, and shared state.
+same error messages. They all read and write the **same `users` table**, so a user created
+through one API is immediately visible through the other three. That makes them a good
+side-by-side comparison of how each language and framework handles routing, validation, and
+database access.
+
+```
+  :8001 python-fastapi ─┐
+  :8002 node-express   ─┤
+  :8003 rust-axum      ─┼──►  postgres:5432  ──  database "users"  ──  table "users"
+  :8004 go-gin         ─┘
+```
 
 ---
 
@@ -20,14 +31,17 @@ comparison of how each language and framework handles routing, validation, and s
 Requirements: [Docker](https://docs.docker.com/get-docker/) with the Compose plugin.
 
 ```bash
-# Build and start all four APIs
+# Build and start Postgres and all four APIs
 docker compose up --build -d
 
 # Run the smoke test against all of them
 ./test.sh
 
-# Stop and remove the containers
+# Stop the containers (data is kept in the "pgdata" volume)
 docker compose down
+
+# Stop the containers AND delete the database
+docker compose down -v
 ```
 
 Once the stack is running:
@@ -36,8 +50,44 @@ Once the stack is running:
 - Node / Express → <http://localhost:8002/users>
 - Rust / Axum → <http://localhost:8003/users>
 - Go / Gin → <http://localhost:8004/users>
+- Postgres → `localhost:5432`, database `users`, user `api`, password `api`
 
-To start only one service: `docker compose up --build rust-axum`.
+To start just one API (Compose starts Postgres for it automatically):
+`docker compose up --build rust-axum`.
+
+To open a SQL shell: `docker compose exec postgres psql -U api -d users`.
+
+---
+
+## Database
+
+### Schema
+
+[`db/init.sql`](db/init.sql) is the single source of truth for the schema. None of the APIs
+create tables themselves.
+
+```sql
+CREATE TABLE IF NOT EXISTS users (
+    id    BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name  TEXT NOT NULL,
+    email TEXT NOT NULL
+);
+```
+
+The Postgres image runs it **only once**, when the `pgdata` volume is empty. After changing
+it, run `docker compose down -v` to recreate the database.
+
+### Configuration
+
+Every API reads its connection string from the `DATABASE_URL` environment variable:
+
+| Where                         | `DATABASE_URL`                                                   |
+| ----------------------------- | ---------------------------------------------------------------- |
+| Inside Docker Compose         | `postgres://api:api@postgres:5432/users` (set in `docker-compose.yml`) |
+| Default, when the variable is unset | `postgres://api:api@localhost:5432/users` (for running an API on your machine) |
+
+The credentials (`api` / `api`) are demo values. Change them in `docker-compose.yml` before
+using this anywhere real.
 
 ---
 
@@ -56,11 +106,11 @@ You can change that with the `PORT` environment variable.
 }
 ```
 
-| Field   | Type    | Notes                                                       |
-| ------- | ------- | ----------------------------------------------------------- |
-| `id`    | integer | Assigned by the server, auto-incremented from `1`, never reused |
-| `name`  | string  | Required, must be non-empty                                 |
-| `email` | string  | Required, must be non-empty (format is not checked)         |
+| Field   | Type    | Notes                                                                  |
+| ------- | ------- | ---------------------------------------------------------------------- |
+| `id`    | integer | Assigned by Postgres (identity column), shared by all four APIs, never reused |
+| `name`  | string  | Required, must be non-empty                                            |
+| `email` | string  | Required, must be non-empty (format is not checked)                    |
 
 Unknown fields in a request body are ignored.
 
@@ -74,7 +124,8 @@ Unknown fields in a request body are ignored.
 | `PUT`    | `/users/{id}` | `{"name","email"}`  | `200` the updated user | `400`, `404` |
 | `DELETE` | `/users/{id}` | –                   | `204` no content | `400`, `404`    |
 
-`PUT` is a full replacement: both `name` and `email` must be sent.
+Any endpoint can also return `500` if the database is unavailable. `PUT` is a full
+replacement: both `name` and `email` must be sent.
 
 ### Errors
 
@@ -82,9 +133,10 @@ Every error has the same shape, `{"error": "<message>"}`:
 
 | Status | Message                         | When                                                                 |
 | ------ | ------------------------------- | -------------------------------------------------------------------- |
-| `400`  | `invalid id`                    | `{id}` is not a positive integer (e.g. `abc`, `0`, `-1`)             |
+| `400`  | `invalid id`                    | `{id}` is not a positive integer that fits in a `BIGINT` (e.g. `abc`, `0`, `-1`, `99999999999999999999`) |
 | `400`  | `name and email are required`   | Body is missing, isn't valid JSON, or `name`/`email` is missing, empty, or not a string |
 | `404`  | `user not found`                | No user with that `id` exists                                        |
+| `500`  | `internal server error`         | The database query failed (e.g. Postgres is down). The detail is logged, not returned. |
 
 When a request has more than one problem, the API reports the first one in this order:
 invalid id, then invalid body, then user not found.
@@ -101,16 +153,16 @@ curl -i -X POST localhost:8001/users \
 # HTTP/1.1 201 Created
 # {"id":1,"name":"Ada","email":"ada@example.com"}
 
-# List
-curl localhost:8001/users
+# List (from a different API: same database)
+curl localhost:8004/users
 # [{"id":1,"name":"Ada","email":"ada@example.com"}]
 
 # Read one
-curl localhost:8001/users/1
+curl localhost:8002/users/1
 # {"id":1,"name":"Ada","email":"ada@example.com"}
 
 # Update (full replacement)
-curl -X PUT localhost:8001/users/1 \
+curl -X PUT localhost:8003/users/1 \
   -H 'Content-Type: application/json' \
   -d '{"name":"Ada Lovelace","email":"ada@example.com"}'
 # {"id":1,"name":"Ada Lovelace","email":"ada@example.com"}
@@ -130,25 +182,34 @@ curl -X POST localhost:8001/users -H 'Content-Type: application/json' -d '{"name
 
 ## Implementations
 
-All four share the same structure: an in-memory map from `id` to user, a counter for the next
-`id`, and five route handlers. The details below cover what differs.
+All four share the same structure: a connection pool created at startup, five route handlers
+that each run a single SQL statement, and the same validation rules. The details below cover
+what differs.
+
+All writes use `RETURNING id, name, email`, so the API returns the row exactly as Postgres
+stored it, without a second query. Every query uses bound parameters (`$1` / `%s`), never
+string concatenation.
 
 ### Python: FastAPI ([`python-fastapi/`](python-fastapi/))
 
-| File               | Purpose                                         |
-| ------------------ | ----------------------------------------------- |
-| `main.py`          | The whole app: models, routes, error handlers   |
-| `requirements.txt` | Pinned `fastapi` and `uvicorn`                  |
-| `Dockerfile`       | `python:3.13-slim`, runs as `nobody`            |
+| File               | Purpose                                                  |
+| ------------------ | -------------------------------------------------------- |
+| `main.py`          | The whole app: models, routes, error handlers, DB pool   |
+| `requirements.txt` | Pinned `fastapi`, `uvicorn`, `psycopg[binary]`, `psycopg-pool` |
+| `Dockerfile`       | `python:3.13-slim`, runs as `nobody`                     |
 
+- **Database:** an `AsyncConnectionPool` from `psycopg_pool`, opened and closed in FastAPI's
+  `lifespan`. A small `query()` helper maps rows straight into the `User` Pydantic model
+  with psycopg's `class_row`. The pool is created with
+  `check=AsyncConnectionPool.check_connection`, so connections broken by a Postgres restart
+  are replaced instead of failing a request.
 - **Validation:** Pydantic models (`UserIn` with `Field(min_length=1)`) and a typed path
-  parameter (`Annotated[int, Path(gt=0)]`). FastAPI returns `422` with a detailed body by
-  default. A custom `RequestValidationError` handler turns that into the shared `400` format.
-- **State:** a module-level `dict[int, User]` and `itertools.count(1)` for IDs. The handlers are
-  `async def`, so they all run on the single event loop and need no lock.
+  parameter (`Annotated[int, Path(gt=0, lt=2**63)]`). FastAPI returns `422` with a detailed
+  body by default. A custom `RequestValidationError` handler turns that into the shared `400`
+  format.
 - **Extras:** free OpenAPI docs at `/docs` and `/redoc`.
 
-Run without Docker:
+Run without Docker (with Postgres running from `docker compose up -d postgres`):
 
 ```bash
 cd python-fastapi
@@ -162,15 +223,19 @@ PORT=8001 python main.py
 | File                | Purpose                                   |
 | ------------------- | ----------------------------------------- |
 | `index.js`          | The whole app                             |
-| `package.json`      | Depends on `express@^5`                   |
+| `package.json`      | Depends on `express@^5` and `pg@^8`       |
 | `package-lock.json` | Locked dependency tree, used by `npm ci`  |
 | `Dockerfile`        | `node:24-alpine`, runs as the `node` user |
 
+- **Database:** a `pg.Pool`. Two node-postgres details are handled explicitly:
+  - `BIGINT` columns arrive as strings by default, so a type parser converts them back to numbers.
+  - The pool gets an `error` listener. Without one, an idle connection dropped by Postgres
+    raises an unhandled `error` event and crashes the process.
 - **Validation:** an `app.param("id", ...)` hook validates `:id` once for every route that has
-  one. A small `parseInput()` helper checks the body. An error middleware catches malformed JSON
-  that `express.json()` rejects.
-- **State:** a `Map` (which keeps insertion order, so the list comes back sorted by `id`) and a
-  `nextId` counter. Node is single-threaded, so no locking is needed.
+  one. It uses `BigInt` so the full `BIGINT` range is accepted. A small `parseInput()` helper
+  checks the body.
+- **Errors:** Express 5 forwards rejected promises from `async` handlers to the error
+  middleware. That middleware turns malformed JSON into a `400` and anything else into a `500`.
 
 Run without Docker:
 
@@ -185,17 +250,18 @@ PORT=8002 npm start
 | File          | Purpose                                                        |
 | ------------- | -------------------------------------------------------------- |
 | `src/main.rs` | The whole app                                                  |
-| `Cargo.toml`  | `axum`, `tokio`, `serde`, `serde_json`                         |
+| `Cargo.toml`  | `axum`, `tokio`, `serde`, `serde_json`, `sqlx` (Postgres only, no default features) |
 | `Cargo.lock`  | Locked dependency tree, used by `cargo build --locked`         |
 | `Dockerfile`  | Multi-stage: `rust:1-slim-bookworm` → `distroless/cc-debian12:nonroot` |
 
-- **Validation:** the handlers take `Result<Path<u64>, PathRejection>` and
+- **Database:** a `sqlx::PgPool`, passed to the handlers as Axum state. Rows map onto `User`
+  with `#[derive(FromRow)]`. The queries use `sqlx::query_as` (checked at runtime), so
+  building the image doesn't need a live database.
+- **Validation:** the handlers take `Result<Path<i64>, PathRejection>` and
   `Result<Json<UserInput>, JsonRejection>` instead of the plain extractors. That way extraction
   failures come back in the shared error format instead of Axum's plain-text rejections.
-  Errors are a small `ApiError` type that implements `IntoResponse`.
-- **State:** `Arc<RwLock<Store>>`, where `Store` holds a `BTreeMap<u64, User>` (always ordered
-  by `id`) and the `next_id` counter. It is shared across Tokio's worker threads via
-  `with_state`.
+- **Errors:** a small `ApiError` type implements `IntoResponse` and `From<sqlx::Error>`, so
+  every database call can simply use `?`.
 - **Image:** the final image holds only the compiled binary on a distroless base, with no
   shell and no package manager.
 
@@ -211,15 +277,16 @@ PORT=8003 cargo run --release
 | File         | Purpose                                                              |
 | ------------ | -------------------------------------------------------------------- |
 | `main.go`    | The whole app                                                        |
-| `go.mod`     | Module definition, requires Go ≥ 1.25 and Gin v1.12                  |
+| `go.mod`     | Module definition, requires Go ≥ 1.25, Gin v1.12, and pgx v5         |
 | `go.sum`     | Dependency checksums                                                 |
 | `Dockerfile` | Multi-stage: `golang:1.27-alpine` → `distroless/static-debian12:nonroot` |
 
+- **Database:** a `pgxpool.Pool`. A `respondWithUser` helper runs any query that returns at
+  most one user (select, insert, update) and maps `pgx.ErrNoRows` to `404`. The list endpoint
+  uses `pgx.CollectRows` with `pgx.RowToStructByPos[User]`. Queries use the request's
+  context, so they are cancelled if the client disconnects.
 - **Validation:** `c.ShouldBindJSON` with `binding:"required"` struct tags (which reject
-  missing or empty strings). `strconv.Atoi` parses the `:id` parameter.
-- **State:** a `store` struct with a `map[int]User`, a `nextID` counter, and a
-  `sync.RWMutex`, because Gin serves each request on its own goroutine. Go maps have no order,
-  so `GET /users` sorts the result by `id`.
+  missing or empty strings). `strconv.ParseInt(..., 64)` parses the `:id` parameter.
 - **Image:** a static (`CGO_ENABLED=0`) binary on a distroless base, with `GIN_MODE=release`.
 
 Run without Docker:
@@ -233,33 +300,51 @@ PORT=8004 go run .
 
 ## Docker Compose
 
-[`docker-compose.yml`](docker-compose.yml) builds each directory's `Dockerfile` and maps
-container port `8080` to a different host port. Condensed, it looks like this:
+[`docker-compose.yml`](docker-compose.yml) defines five services:
 
-```yaml
-services:
-  python-fastapi: { build: ./python-fastapi, ports: ["8001:8080"] }
-  node-express:   { build: ./node-express,   ports: ["8002:8080"] }
-  rust-axum:      { build: ./rust-axum,      ports: ["8003:8080"] }
-  go-gin:         { build: ./go-gin,         ports: ["8004:8080"] }
-```
+- **`postgres`** (`postgres:18-alpine`):
+  - creates the `users` database and the `api` user;
+  - runs `db/init.sql` on first start;
+  - stores its data in the named volume `pgdata`;
+  - publishes port `5432` so you can connect from your machine.
+- **The four APIs** each build their own directory's `Dockerfile` and map container port
+  `8080` to host ports `8001`–`8004`. They share one block of settings through a YAML anchor
+  (`x-api`):
 
-Each service also sets `init: true`, which runs a tiny init process as PID 1. Node and the
-Rust binary don't handle `SIGTERM` when they run as PID 1, so without it,
-`docker compose stop` would hang for 10 seconds before killing them.
+  ```yaml
+  x-api: &api
+    init: true
+    environment:
+      DATABASE_URL: postgres://api:api@postgres:5432/users
+    depends_on:
+      postgres:
+        condition: service_healthy
+  ```
 
-All containers run as a non-root user.
+Some details:
 
-Each service is independent: they don't talk to each other or share data. Creating a user on
-port `8001` doesn't create it on `8002`.
+- **Start order:** Postgres has a `pg_isready` health check, and every API waits for it to be
+  healthy before starting. The check connects over TCP on purpose. While `init.sql` runs,
+  Postgres uses a temporary server that only listens on a Unix socket, so a socket check would
+  report "ready" too early.
+- **`init: true`** runs a tiny init process as PID 1. Node and the Rust binary don't handle
+  `SIGTERM` when they run as PID 1, so without it, `docker compose stop` would hang for 10
+  seconds before killing them.
+- **Non-root:** all API containers run as a non-root user.
 
 ---
 
 ## Smoke test
 
-[`test.sh`](test.sh) runs the same scenario against every API: create, list, read, update,
-bad input, bad id, delete, then read and delete again to check for `404`. It exits non-zero if
-any status code is wrong. It needs only `bash` and `curl`.
+[`test.sh`](test.sh) needs only `bash` and `curl`. It waits for each API to come up, then runs:
+
+1. **The same scenario against each API:** create, list, read, update, bad input, bad id,
+   delete, then read and delete again to check for `404`.
+2. **A shared-database check:** it creates a user on `8001`, reads it on `8002`, updates it on
+   `8003`, deletes it on `8004`, and confirms it's gone on `8001`.
+
+It exits non-zero if any status code is wrong. It cleans up after itself, so it can be run
+repeatedly against the same database.
 
 ```bash
 ./test.sh                  # against localhost
@@ -272,6 +357,13 @@ python-fastapi (http://localhost:8001)
   ok    GET    /users         -> 200
   ok    GET    /users/1       -> 200
   ...
+shared database
+  ok    POST   /users         -> 201
+  ok    GET    /users/5       -> 200
+  ok    PUT    /users/5       -> 200
+  ok    DELETE /users/5       -> 204
+  ok    GET    /users/5       -> 404
+
 all checks passed
 ```
 
@@ -283,6 +375,8 @@ all checks passed
 .
 ├── docker-compose.yml
 ├── test.sh
+├── db/
+│   └── init.sql
 ├── python-fastapi/
 │   ├── Dockerfile
 │   ├── main.py
@@ -308,7 +402,7 @@ all checks passed
 
 These are deliberately minimal demo services:
 
-- **Data lives only in memory.** It is lost when a container restarts, and it isn't shared
-  between replicas.
 - No authentication, pagination, email-format validation, or uniqueness checks.
-- No persistence layer, so there are no migrations and no database.
+- No migration tool: the schema is created once by `db/init.sql`. Changing it means
+  recreating the volume (`docker compose down -v`) or running the `ALTER` statements yourself.
+- Hard-coded demo database credentials in `docker-compose.yml`.

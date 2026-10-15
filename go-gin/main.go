@@ -1,18 +1,20 @@
 package main
 
 import (
-	"cmp"
+	"context"
+	"errors"
+	"log"
 	"net/http"
 	"os"
-	"slices"
 	"strconv"
-	"sync"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type User struct {
-	ID    int    `json:"id"`
+	ID    int64  `json:"id"`
 	Name  string `json:"name"`
 	Email string `json:"email"`
 }
@@ -22,15 +24,13 @@ type userInput struct {
 	Email string `json:"email" binding:"required"`
 }
 
-type store struct {
-	mu     sync.RWMutex
-	users  map[int]User
-	nextID int
+type server struct {
+	db *pgxpool.Pool
 }
 
 // parseID writes a 400 response and returns false when :id is not a positive integer.
-func parseID(c *gin.Context) (int, bool) {
-	id, err := strconv.Atoi(c.Param("id"))
+func parseID(c *gin.Context) (int64, bool) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || id < 1 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
 		return 0, false
@@ -52,51 +52,54 @@ func notFound(c *gin.Context) {
 	c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 }
 
-func (s *store) list(c *gin.Context) {
-	s.mu.RLock()
-	users := make([]User, 0, len(s.users))
-	for _, user := range s.users {
-		users = append(users, user)
-	}
-	s.mu.RUnlock()
+func internalError(c *gin.Context, err error) {
+	log.Printf("database error: %v", err)
+	c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+}
 
-	slices.SortFunc(users, func(a, b User) int { return cmp.Compare(a.ID, b.ID) })
+// respondWithUser runs a query that returns at most one user and writes it as the response.
+func (s *server) respondWithUser(c *gin.Context, status int, sql string, args ...any) {
+	var user User
+	err := s.db.QueryRow(c.Request.Context(), sql, args...).Scan(&user.ID, &user.Name, &user.Email)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		notFound(c)
+	case err != nil:
+		internalError(c, err)
+	default:
+		c.JSON(status, user)
+	}
+}
+
+func (s *server) list(c *gin.Context) {
+	rows, _ := s.db.Query(c.Request.Context(), "SELECT id, name, email FROM users ORDER BY id")
+	users, err := pgx.CollectRows(rows, pgx.RowToStructByPos[User])
+	if err != nil {
+		internalError(c, err)
+		return
+	}
 	c.JSON(http.StatusOK, users)
 }
 
-func (s *store) get(c *gin.Context) {
+func (s *server) get(c *gin.Context) {
 	id, ok := parseID(c)
 	if !ok {
 		return
 	}
-
-	s.mu.RLock()
-	user, found := s.users[id]
-	s.mu.RUnlock()
-
-	if !found {
-		notFound(c)
-		return
-	}
-	c.JSON(http.StatusOK, user)
+	s.respondWithUser(c, http.StatusOK, "SELECT id, name, email FROM users WHERE id = $1", id)
 }
 
-func (s *store) create(c *gin.Context) {
+func (s *server) create(c *gin.Context) {
 	input, ok := bindInput(c)
 	if !ok {
 		return
 	}
-
-	s.mu.Lock()
-	user := User{ID: s.nextID, Name: input.Name, Email: input.Email}
-	s.users[user.ID] = user
-	s.nextID++
-	s.mu.Unlock()
-
-	c.JSON(http.StatusCreated, user)
+	s.respondWithUser(c, http.StatusCreated,
+		"INSERT INTO users (name, email) VALUES ($1, $2) RETURNING id, name, email",
+		input.Name, input.Email)
 }
 
-func (s *store) update(c *gin.Context) {
+func (s *server) update(c *gin.Context) {
 	id, ok := parseID(c)
 	if !ok {
 		return
@@ -105,42 +108,42 @@ func (s *store) update(c *gin.Context) {
 	if !ok {
 		return
 	}
-
-	s.mu.Lock()
-	_, found := s.users[id]
-	user := User{ID: id, Name: input.Name, Email: input.Email}
-	if found {
-		s.users[id] = user
-	}
-	s.mu.Unlock()
-
-	if !found {
-		notFound(c)
-		return
-	}
-	c.JSON(http.StatusOK, user)
+	s.respondWithUser(c, http.StatusOK,
+		"UPDATE users SET name = $1, email = $2 WHERE id = $3 RETURNING id, name, email",
+		input.Name, input.Email, id)
 }
 
-func (s *store) delete(c *gin.Context) {
+func (s *server) delete(c *gin.Context) {
 	id, ok := parseID(c)
 	if !ok {
 		return
 	}
-
-	s.mu.Lock()
-	_, found := s.users[id]
-	delete(s.users, id)
-	s.mu.Unlock()
-
-	if !found {
+	tag, err := s.db.Exec(c.Request.Context(), "DELETE FROM users WHERE id = $1", id)
+	switch {
+	case err != nil:
+		internalError(c, err)
+	case tag.RowsAffected() == 0:
 		notFound(c)
-		return
+	default:
+		c.Status(http.StatusNoContent)
 	}
-	c.Status(http.StatusNoContent)
+}
+
+func getenv(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
 }
 
 func main() {
-	s := &store{users: map[int]User{}, nextID: 1}
+	db, err := pgxpool.New(context.Background(),
+		getenv("DATABASE_URL", "postgres://api:api@localhost:5432/users"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+	s := &server{db: db}
 
 	r := gin.Default()
 	r.GET("/users", s.list)
@@ -149,11 +152,7 @@ func main() {
 	r.PUT("/users/:id", s.update)
 	r.DELETE("/users/:id", s.delete)
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-	if err := r.Run(":" + port); err != nil {
-		panic(err)
+	if err := r.Run(":" + getenv("PORT", "8080")); err != nil {
+		log.Fatal(err)
 	}
 }

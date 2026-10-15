@@ -34,6 +34,12 @@ for api in "${APIS[@]}"; do
   BASE="http://$HOST:${api##*:}"
   echo "$name ($BASE)"
 
+  # `docker compose up -d` returns before the servers are listening.
+  for _ in {1..30}; do
+    curl -s -o /dev/null "$BASE/users" && break
+    sleep 1
+  done
+
   expect 201 POST /users '{"name":"Ada","email":"ada@example.com"}'
   id=$(grep -o '"id":[0-9]*' <<<"$body" | cut -d: -f2)
 
@@ -48,6 +54,16 @@ for api in "${APIS[@]}"; do
   expect 404 DELETE "/users/$id"
   echo
 done
+
+# All four APIs share one database: a user created through one is visible through the others.
+echo "shared database"
+BASE="http://$HOST:8001" expect 201 POST /users '{"name":"Shared","email":"shared@example.com"}'
+id=$(grep -o '"id":[0-9]*' <<<"$body" | cut -d: -f2)
+BASE="http://$HOST:8002" expect 200 GET "/users/$id"
+BASE="http://$HOST:8003" expect 200 PUT "/users/$id" '{"name":"Shared 2","email":"shared@example.com"}'
+BASE="http://$HOST:8004" expect 204 DELETE "/users/$id"
+BASE="http://$HOST:8001" expect 404 GET "/users/$id"
+echo
 
 if ((failures > 0)); then
   echo "$failures check(s) failed"

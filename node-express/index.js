@@ -1,10 +1,19 @@
 const express = require("express");
+const { Pool, types } = require("pg");
+
+// BIGINT ids arrive as strings by default; they fit safely in a JS number here.
+types.setTypeParser(types.builtins.INT8, Number);
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL ?? "postgres://api:api@localhost:5432/users",
+});
+// Without a listener, an idle connection dropped by Postgres crashes the process.
+pool.on("error", (err) => console.error("idle database connection failed:", err.message));
+
+const MAX_ID = 2n ** 63n - 1n; // Postgres BIGINT
 
 const app = express();
 app.use(express.json());
-
-const users = new Map();
-let nextId = 1;
 
 // Returns { name, email } when both are non-empty strings, otherwise null.
 function parseInput(body) {
@@ -15,54 +24,67 @@ function parseInput(body) {
   return { name, email };
 }
 
-// Every route with an :id must receive a positive integer.
+function notFound(res) {
+  res.status(404).json({ error: "user not found" });
+}
+
+// Every route with an :id must receive a positive integer that fits in a BIGINT.
 app.param("id", (req, res, next, raw) => {
-  const id = Number(raw);
-  if (!Number.isInteger(id) || id < 1) {
+  const id = /^\d+$/.test(raw) ? BigInt(raw) : 0n;
+  if (id < 1n || id > MAX_ID) {
     return res.status(400).json({ error: "invalid id" });
   }
   req.userId = id;
   next();
 });
 
-app.get("/users", (req, res) => {
-  res.json([...users.values()]);
+app.get("/users", async (req, res) => {
+  const { rows } = await pool.query("SELECT id, name, email FROM users ORDER BY id");
+  res.json(rows);
 });
 
-app.get("/users/:id", (req, res) => {
-  const user = users.get(req.userId);
-  if (!user) return res.status(404).json({ error: "user not found" });
-  res.json(user);
+app.get("/users/:id", async (req, res) => {
+  const { rows } = await pool.query("SELECT id, name, email FROM users WHERE id = $1", [
+    req.userId,
+  ]);
+  if (rows.length === 0) return notFound(res);
+  res.json(rows[0]);
 });
 
-app.post("/users", (req, res) => {
+app.post("/users", async (req, res) => {
   const input = parseInput(req.body);
   if (!input) return res.status(400).json({ error: "name and email are required" });
-  const user = { id: nextId++, ...input };
-  users.set(user.id, user);
-  res.status(201).json(user);
+  const { rows } = await pool.query(
+    "INSERT INTO users (name, email) VALUES ($1, $2) RETURNING id, name, email",
+    [input.name, input.email],
+  );
+  res.status(201).json(rows[0]);
 });
 
-app.put("/users/:id", (req, res) => {
+app.put("/users/:id", async (req, res) => {
   const input = parseInput(req.body);
   if (!input) return res.status(400).json({ error: "name and email are required" });
-  if (!users.has(req.userId)) return res.status(404).json({ error: "user not found" });
-  const user = { id: req.userId, ...input };
-  users.set(user.id, user);
-  res.json(user);
+  const { rows } = await pool.query(
+    "UPDATE users SET name = $1, email = $2 WHERE id = $3 RETURNING id, name, email",
+    [input.name, input.email, req.userId],
+  );
+  if (rows.length === 0) return notFound(res);
+  res.json(rows[0]);
 });
 
-app.delete("/users/:id", (req, res) => {
-  if (!users.delete(req.userId)) return res.status(404).json({ error: "user not found" });
+app.delete("/users/:id", async (req, res) => {
+  const { rowCount } = await pool.query("DELETE FROM users WHERE id = $1", [req.userId]);
+  if (rowCount === 0) return notFound(res);
   res.status(204).end();
 });
 
-// express.json() rejects malformed bodies before they reach a route.
+// Malformed JSON is rejected by express.json(); anything else is an unexpected failure.
 app.use((err, req, res, next) => {
   if (err.type === "entity.parse.failed") {
     return res.status(400).json({ error: "name and email are required" });
   }
-  next(err);
+  console.error(err);
+  res.status(500).json({ error: "internal server error" });
 });
 
 const port = process.env.PORT || 8080;

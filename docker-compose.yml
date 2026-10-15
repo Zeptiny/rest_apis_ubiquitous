@@ -1,24 +1,54 @@
+# Settings shared by every API service.
+x-api: &api
+  init: true
+  environment:
+    DATABASE_URL: postgres://api:api@postgres:5432/users
+  depends_on:
+    postgres:
+      condition: service_healthy
+
 services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: api
+      POSTGRES_PASSWORD: api
+      POSTGRES_DB: users
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      # TCP check: the temporary server used while running init.sql only listens on a socket.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "api", "-d", "users"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
   python-fastapi:
+    <<: *api
     build: ./python-fastapi
-    init: true
     ports:
       - "8001:8080"
 
   node-express:
+    <<: *api
     build: ./node-express
-    init: true
     ports:
       - "8002:8080"
 
   rust-axum:
+    <<: *api
     build: ./rust-axum
-    init: true
     ports:
       - "8003:8080"
 
   go-gin:
+    <<: *api
     build: ./go-gin
-    init: true
     ports:
       - "8004:8080"
+
+volumes:
+  pgdata:
