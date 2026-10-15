@@ -1,0 +1,24 @@
+services:
+  python-fastapi:
+    build: ./python-fastapi
+    init: true
+    ports:
+      - "8001:8080"
+
+  node-express:
+    build: ./node-express
+    init: true
+    ports:
+      - "8002:8080"
+
+  rust-axum:
+    build: ./rust-axum
+    init: true
+    ports:
+      - "8003:8080"
+
+  go-gin:
+    build: ./go-gin
+    init: true
+    ports:
+      - "8004:8080"
