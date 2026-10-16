@@ -1,0 +1,14 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "users (docker compose)",
+      "Group": "Servers",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "users",
+      "Username": "api",
+      "PassFile": "/pgpass",
+      "SSLMode": "prefer"
+    }
+  }
+}

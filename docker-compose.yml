@@ -9,22 +9,19 @@ x-api: &api
 
 services:
   postgres:
-    image: postgres:18-alpine
-    environment:
-      POSTGRES_USER: api
-      POSTGRES_PASSWORD: api
-      POSTGRES_DB: users
+    build: ./postgres
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql
-      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
-    healthcheck:
-      # TCP check: the temporary server used while running init.sql only listens on a socket.
-      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "api", "-d", "users"]
-      interval: 2s
-      timeout: 5s
-      retries: 15
+
+  pgadmin:
+    build: ./pgadmin
+    ports:
+      - "5050:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   python-fastapi:
     <<: *api
